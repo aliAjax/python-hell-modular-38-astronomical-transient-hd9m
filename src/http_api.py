@@ -138,6 +138,11 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if parts == ["api", "dispatch"]:
+                    body = self._body()
+                    return self._send(
+                        200, service.dispatch_pending(actor, batch_id=body.get("batch_id"))
+                    )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     return self._send(

@@ -18,6 +18,12 @@ def main(argv=None):
     repository = SQLiteRepository(args.db)
     rules = RuleEngine()
     service = DomainService(repository, rules)
+    resumed = service.dispatch_pending()
+    if resumed["sent"] or resumed["failed"]:
+        print(
+            "resumed pending deliveries: %(sent)d sent, %(failed)d failed" % resumed,
+            flush=True,
+        )
     server = create_server(
         args.host,
         args.port,

@@ -1,4 +1,10 @@
+from datetime import datetime, timezone
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _find_one(lookup, kind, field, value):
@@ -29,6 +35,37 @@ def calculate_priority(magnitude, transient_type):
 
 def measurements_overlap(first_start, first_end, second_start, second_end):
     return str(first_start) < str(second_end) and str(second_start) < str(first_end)
+
+
+def effective_magnitude(candidate_data):
+    """Brightness basis for broadcast matching: latest merged measurement wins."""
+    measurements = candidate_data.get("measurements") or []
+    if measurements:
+        latest = sorted(measurements, key=lambda item: str(item.get("observed_at", "")))[-1]
+        return float(latest["magnitude"])
+    return float(candidate_data.get("magnitude"))
+
+
+def subscription_matches(subscription_data, candidate_data):
+    """A station receives candidates from the subscribed source that are
+    at least as bright as the subscription magnitude threshold."""
+    source_id = subscription_data.get("source_id") or None
+    if source_id and source_id != candidate_data.get("source_id"):
+        return False
+    threshold = subscription_data.get("max_magnitude")
+    if threshold is None:
+        return False
+    return effective_magnitude(candidate_data) <= float(threshold)
+
+
+def _parse_threshold(value):
+    try:
+        magnitude = float(value)
+    except (TypeError, ValueError):
+        raise ValidationError("max_magnitude must be numeric")
+    if magnitude < -30 or magnitude > 40:
+        raise ValidationError("max_magnitude is outside the supported range")
+    return magnitude
 
 
 def _validate_source(actor, data, lookup):
@@ -122,6 +159,61 @@ def _validate_correct(actor, entity, data, lookup):
     return {"corrected_by": actor.user_id}
 
 
+def _validate_subscription(actor, data, lookup):
+    station_id = str(data.get("station_id", "")).strip()
+    if not station_id:
+        raise ValidationError("station_id is required")
+    threshold = _parse_threshold(data.get("max_magnitude"))
+    source_id = data.get("source_id") or None
+    if source_id and not _find_one(lookup, "source", "id", source_id):
+        raise ValidationError("source does not exist")
+    if lookup:
+        for other in lookup("subscription", "station_id", station_id) or []:
+            if (other["data"].get("source_id") or None) == source_id:
+                raise ConflictError("subscription already exists for station and source")
+    return {"station_id": station_id, "source_id": source_id, "max_magnitude": threshold}
+
+
+def _validate_update_threshold(actor, entity, data, lookup):
+    threshold = _parse_threshold(data.get("max_magnitude"))
+    return {
+        "max_magnitude": threshold,
+        "previous_max_magnitude": entity["data"].get("max_magnitude"),
+    }
+
+
+def _ensure_station_owner(actor, entity):
+    station_id = entity["data"].get("station_id")
+    if actor.role != "admin" and actor.user_id != station_id:
+        raise PermissionDenied(
+            "actor %s cannot receipt a delivery for station %s" % (actor.user_id, station_id)
+        )
+
+
+def _validate_acknowledge(actor, entity, data, lookup):
+    _ensure_station_owner(actor, entity)
+    return {
+        "receipt": {
+            "result": "acknowledged",
+            "by": actor.user_id,
+            "note": data.get("note"),
+            "receipt_at": _utcnow(),
+        }
+    }
+
+
+def _validate_reject(actor, entity, data, lookup):
+    _ensure_station_owner(actor, entity)
+    return {
+        "receipt": {
+            "result": "rejected",
+            "by": actor.user_id,
+            "reason": data.get("reason"),
+            "receipt_at": _utcnow(),
+        }
+    }
+
+
 def _validate_schedule(actor, entity, data, lookup):
     observations = lookup("observation", "telescope_id", entity["data"].get("telescope_id")) if lookup else []
     for other in observations:
@@ -154,12 +246,15 @@ class RuleEngine:
         "candidates": "candidate",
         "telescopes": "telescope",
         "observations": "observation",
+        "subscriptions": "subscription",
+        "deliveries": "delivery",
     }
     INITIAL_STATUS = {
         "source": "registered",
         "candidate": "detected",
         "telescope": "available",
         "observation": "requested",
+        "subscription": "active",
     }
     TRANSITIONS = {
         "source": {
@@ -169,9 +264,9 @@ class RuleEngine:
         "candidate": {
             "merge_measurement": (("detected", "triaged"), "triaged"),
             "triage": (("detected",), "triaged"),
-            "reclassify": (("triaged",), "triaged"),
+            "reclassify": (("triaged", "classified"), None),
             "correct": (("detected", "triaged", "classified"), "triaged"),
-            "withdraw": (("detected", "triaged"), "withdrawn"),
+            "withdraw": (("detected", "triaged", "classified"), "withdrawn"),
             "classify": (("triaged",), "classified"),
         },
         "telescope": {
@@ -184,12 +279,22 @@ class RuleEngine:
             "withdraw": (("requested", "scheduled"), "withdrawn"),
             "correct": (("requested", "scheduled"), "requested"),
         },
+        "subscription": {
+            "pause": (("active",), "paused"),
+            "resume": (("paused",), "active"),
+            "update_threshold": (("active", "paused"), None),
+        },
+        "delivery": {
+            "acknowledge": (("delivered",), "acknowledged"),
+            "reject": (("delivered",), "rejected"),
+        },
     }
     CREATE_REQUIRED = {
         "source": ("name", "survey_name"),
         "candidate": ("source_id", "event_id", "ra", "dec", "magnitude", "transient_type", "observed_at"),
         "telescope": ("name", "aperture_m", "site_name"),
         "observation": ("candidate_id", "telescope_id", "team_id", "start_at", "end_at", "mode"),
+        "subscription": ("station_id", "max_magnitude"),
     }
     ACTION_REQUIRED = {
         ("source", "retire"): ("reason",),
@@ -203,12 +308,15 @@ class RuleEngine:
         ("observation", "schedule"): ("operator_id",),
         ("observation", "withdraw"): ("reason",),
         ("observation", "correct"): ("reason",),
+        ("subscription", "update_threshold"): ("max_magnitude",),
+        ("delivery", "reject"): ("reason",),
     }
     CREATE_ROLES = {
         "source": ("analyst", "admin"),
         "candidate": ("analyst", "operator", "admin"),
         "telescope": ("coordinator", "admin"),
         "observation": ("analyst", "coordinator", "admin"),
+        "subscription": ("operator", "coordinator", "admin"),
     }
     ROLE_ACTIONS = {
         "activate": ("coordinator", "admin"),
@@ -223,12 +331,18 @@ class RuleEngine:
         "restore": ("coordinator", "admin"),
         "schedule": ("coordinator", "admin"),
         "complete": ("operator", "coordinator", "admin"),
+        "pause": ("operator", "coordinator", "admin"),
+        "resume": ("operator", "coordinator", "admin"),
+        "update_threshold": ("operator", "coordinator", "admin"),
+        "acknowledge": ("operator", "coordinator", "admin"),
+        "reject": ("operator", "coordinator", "admin"),
     }
     CUSTOM_CREATE = {
         "source": _validate_source,
         "candidate": _validate_candidate,
         "telescope": _validate_telescope,
         "observation": _validate_observation,
+        "subscription": _validate_subscription,
     }
     CUSTOM_TRANSITIONS = {
         ("candidate", "merge_measurement"): _validate_merge_measurement,
@@ -236,6 +350,9 @@ class RuleEngine:
         ("candidate", "correct"): _validate_correct,
         ("observation", "schedule"): _validate_schedule,
         ("observation", "correct"): _validate_correct,
+        ("subscription", "update_threshold"): _validate_update_threshold,
+        ("delivery", "acknowledge"): _validate_acknowledge,
+        ("delivery", "reject"): _validate_reject,
     }
 
     def normalize_kind(self, kind):
@@ -284,4 +401,4 @@ class RuleEngine:
         patch = dict(data)
         if extra:
             patch.update(extra)
-        return next_status, patch
+        return next_status or entity["status"], patch
