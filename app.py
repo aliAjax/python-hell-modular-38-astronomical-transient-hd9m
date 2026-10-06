@@ -18,6 +18,11 @@ def main(argv=None):
     repository = SQLiteRepository(args.db)
     rules = RuleEngine()
     service = DomainService(repository, rules)
+    # 升级回填：把已确认但没有广播记录的候选补成未投递；幂等，可重复执行。
+    try:
+        service.backfill()
+    except Exception as exc:
+        print("broadcast backfill skipped: %s" % exc, flush=True)
     server = create_server(
         args.host,
         args.port,

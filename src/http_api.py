@@ -76,6 +76,11 @@ def create_handler(service, rules, static_dir):
             try:
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
+                query = parse_qs(parsed.query)
+
+                def _one(name):
+                    return query.get(name, [None])[0]
+
                 if parsed.path == "/health":
                     return self._send(200, service.health())
                 if parsed.path == "/":
@@ -84,6 +89,29 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "subscriptions"]:
+                    return self._send(200, {"items": service.list_subscriptions(
+                        station_id=_one("station_id"),
+                        source_id=_one("source_id"),
+                        active=_one("active"),
+                    )})
+                if len(parts) == 3 and parts[:2] == ["api", "subscriptions"]:
+                    return self._send(200, service.get_subscription(parts[2]))
+                if parts == ["api", "deliveries"]:
+                    return self._send(200, {"items": service.list_deliveries(
+                        candidate_id=_one("candidate_id"),
+                        station_id=_one("station_id"),
+                        status=_one("status"),
+                        batch_id=_one("batch_id"),
+                    )})
+                if len(parts) == 3 and parts[:2] == ["api", "deliveries"]:
+                    return self._send(200, service.get_delivery(parts[2]))
+                if parts == ["api", "broadcast", "pending"]:
+                    return self._send(200, {"items": service.pending_deliveries()})
+                if parts == ["api", "broadcast", "batches"]:
+                    return self._send(200, {"items": service.list_batches(
+                        candidate_id=_one("candidate_id"),
+                    )})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -91,8 +119,7 @@ def create_handler(service, rules, static_dir):
                         raise NotFoundError("not found")
                     if len(parts) == 3:
                         return self._send(200, service.get(parts[2]))
-                    query = parse_qs(parsed.query)
-                    status = query.get("status", [None])[0]
+                    status = _one("status")
                     return self._send(200, {"items": service.list(parts[1], status=status)})
                 raise NotFoundError("not found")
             except Exception as exc:
@@ -103,6 +130,23 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if parts == ["api", "subscriptions"]:
+                    return self._send(201, service.create_subscription(actor, self._body()))
+                if len(parts) == 4 and parts[:2] == ["api", "subscriptions"] and parts[3] == "actions":
+                    body = self._body()
+                    expected = body.pop("expected_version", None)
+                    body.pop("action", None)
+                    return self._send(200, service.update_subscription(actor, parts[2], body, expected))
+                if len(parts) == 4 and parts[:2] == ["api", "deliveries"] and parts[3] == "actions":
+                    body = self._body()
+                    action = body.pop("action", None)
+                    if not action:
+                        raise ValidationError("action is required")
+                    return self._send(200, service.delivery_action(actor, parts[2], action, body))
+                if len(parts) == 3 and parts[:2] == ["api", "broadcast"] and parts[2] == "backfill":
+                    return self._send(200, service.backfill(actor))
+                if len(parts) == 5 and parts[:2] == ["api", "broadcast"] and parts[2] == "batches" and parts[4] == "retry":
+                    return self._send(200, service.retry_batch(actor, parts[3]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
